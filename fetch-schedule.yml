@@ -5,50 +5,78 @@ on:
     - cron: '0 * * * *'   # runs every hour automatically
   workflow_dispatch:        # also lets you run it manually from GitHub
 
+permissions:
+  contents: write           # required to push schedule.json back to the repo
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 10      # safety net: fail loud instead of hanging for hours
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fetch ESPN schedule data
         run: |
           node << 'SCRIPT'
           const https = require('https');
           const fs = require('fs');
-
           const LEAGUES = [
-            {espn:'baseball/mlb',      label:'MLB',       women:false},
-            {espn:'basketball/nba',    label:'NBA',       women:false},
-            {espn:'basketball/wnba',   label:'WNBA',      women:true},
-            {espn:'hockey/nhl',        label:'NHL',       women:false},
-            {espn:'golf/pga',          label:'PGA Tour',  women:false},
-            {espn:'golf/lpga',         label:'LPGA Tour', women:true},
-            {espn:'soccer/fifa.world', label:'World Cup', women:false},
-            {espn:'soccer/usa.nwsl',   label:'NWSL',      women:true},
-            {espn:'soccer/usa.1',      label:'MLS',       women:false},
-            {espn:'tennis/atp',        label:'Tennis',    women:false},
-            {espn:'tennis/wta',        label:'Tennis',    women:true},
-            {espn:'soccer/usa.usl.1',  label:'USL',       women:false},
+            {espn:'baseball/mlb',           label:'MLB',        women:false},
+            {espn:'football/nfl',           label:'NFL',        women:false},
+            {espn:'basketball/nba',         label:'NBA',        women:false},
+            {espn:'basketball/wnba',        label:'WNBA',       women:true},
+            {espn:'hockey/nhl',             label:'NHL',        women:false},
+            {espn:'golf/pga',               label:'PGA Tour',   women:false},
+            {espn:'golf/lpga',              label:'LPGA Tour',  women:true},
+            {espn:'tennis/atp',             label:'Tennis',     women:false},
+            {espn:'tennis/wta',             label:'Tennis',     women:true},
+            {espn:'soccer/usa.1',           label:'MLS',        women:false},
+            {espn:'soccer/usa.nwsl',        label:'NWSL',       women:true},
+            {espn:'soccer/usa.usl.1',       label:'USL',        women:false},
+            {espn:'soccer/fifa.world',      label:'World Cup',  women:false},
+            {espn:'soccer/eng.1',           label:'EPL',        women:false},
+            {espn:'soccer/esp.1',           label:'La Liga',    women:false},
+            {espn:'soccer/ita.1',           label:'Serie A',    women:false},
+            {espn:'soccer/ger.1',           label:'Bundesliga', women:false},
+            {espn:'soccer/fra.1',           label:'Ligue 1',    women:false},
+            {espn:'soccer/uefa.champions',  label:'UCL',        women:false},
           ];
 
-          function fetch(url) {
+          const REQUEST_TIMEOUT_MS = 8000;
+
+          function fetchJson(url) {
             return new Promise((resolve, reject) => {
-              https.get(url, {
+              const req = https.get(url, {
                 headers: {
-                  'User-Agent': 'Mozilla/5.0 (compatible; OAC-Schedule-Bot/1.0)',
+                  'User-Agent': 'OAC-Schedule-Bot/1.0',
                   'Accept': 'application/json',
-                }
+                },
+                timeout: REQUEST_TIMEOUT_MS,
               }, (res) => {
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                  res.resume(); // drain so the socket can close cleanly
+                  return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+                }
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
                   try { resolve(JSON.parse(data)); }
-                  catch(e) { reject(e); }
+                  catch(e) { reject(new Error('JSON parse failed: ' + e.message)); }
                 });
-              }).on('error', reject);
+              });
+              // Fires if no response arrives within REQUEST_TIMEOUT_MS.
+              // Without this, a connection ESPN accepts but never responds to
+              // hangs forever — nothing resolves, nothing rejects, and since
+              // every fetch is awaited sequentially, the whole run stalls
+              // until GitHub's default 6-hour job timeout kills it silently.
+              req.on('timeout', () => req.destroy(new Error(`Request timed out after ${REQUEST_TIMEOUT_MS}ms: ${url}`)));
+              req.on('error', reject);
             });
           }
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
 
           function ymd(d) {
             return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
@@ -61,95 +89,102 @@ jobs:
           async function main() {
             const result = {};
 
-            // Fetch 7 days worth of data (today through +6)
-            for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
-              const targetDate = new Date();
-              targetDate.setDate(targetDate.getDate() + dayOffset);
+            // Build the set of unique ESPN dates we actually need across the
+            // whole 8-day window, instead of re-requesting overlapping -1/0/+1
+            // windows per day. This cuts request volume from
+            // 8 days x 12 leagues x 3 dates = 288/run
+            // down to
+            // ~10 unique dates x 12 leagues = ~120/run,
+            // which reduces the chance of tripping ESPN's undocumented
+            // rate limiting/throttling on this hourly job.
+            const first = new Date(); first.setDate(first.getDate() - 1);
+            const last  = new Date(); last.setDate(last.getDate() + 8);
+            const range = `${ymd(first)}-${ymd(last)}`;
 
-              // Fetch prev/current/next ESPN date to handle PT/ET boundary
-              const espnDates = [-1, 0, 1].map(i => {
-                const d = new Date(targetDate);
-                d.setDate(d.getDate() + i);
-                return ymd(d);
-              });
-
-              for (const lg of LEAGUES) {
-                for (const dateStr of espnDates) {
-                  try {
-                    const url = `https://site.api.espn.com/apis/site/v2/sports/${lg.espn}/scoreboard?dates=${dateStr}`;
-                    const json = await fetch(url);
-
-                    for (const ev of (json.events || [])) {
+            const counts = {};
+            for (const lg of LEAGUES) {
+                counts[lg.label] = counts[lg.label] || 0;
+                try {
+                  const url = `https://site.web.api.espn.com/apis/site/v2/sports/${lg.espn}/scoreboard?dates=${range}&limit=1000`;
+                  const json = await fetchJson(url);
+                  await sleep(250);
+                  for (const ev of (json.events || [])) {
+                    try {
+                      const comp = ev.competitions[0];
+                      const home = comp.competitors.find(c => c.homeAway === 'home');
+                      const away = comp.competitors.find(c => c.homeAway === 'away');
+                      const dt = new Date(ev.date);
+                      const pacificDate = dk(dt);
+                      let rawBroadcast = null;
                       try {
-                        const comp = ev.competitions[0];
-                        const home = comp.competitors.find(c => c.homeAway === 'home');
-                        const away = comp.competitors.find(c => c.homeAway === 'away');
-                        const dt = new Date(ev.date);
-                        const pacificDate = dk(dt);  // stored in UTC but display logic handles PT
-
-                        // Read broadcast
-                        let rawBroadcast = null;
-                        try {
-                          if (comp.broadcasts && comp.broadcasts.length)
-                            rawBroadcast = comp.broadcasts[0].names?.[0] || comp.broadcasts[0].media?.shortName || null;
-                          if (!rawBroadcast && comp.geoBroadcasts && comp.geoBroadcasts.length)
-                            rawBroadcast = comp.geoBroadcasts[0].media?.shortName || null;
-                        } catch(e) {}
-
-                        const event = {
-                          league: lg.label,
-                          isWomen: lg.women,
-                          home: home.team.shortDisplayName || home.team.abbreviation,
-                          away: away.team.shortDisplayName || away.team.abbreviation,
-                          homeFull: home.team.displayName || '',
-                          awayFull: away.team.displayName || '',
-                          homeScore: home.score !== undefined ? parseInt(home.score) : null,
-                          awayScore: away.score !== undefined ? parseInt(away.score) : null,
-                          status: ev.status.type.state,
-                          statusDetail: ev.status.type.shortDetail || '',
-                          isoDate: ev.date,
-                          venue: comp.venue ? comp.venue.fullName : '',
-                          broadcast: rawBroadcast,
-                        };
-
-                        if (!result[pacificDate]) result[pacificDate] = [];
-
-                        // Deduplicate
-                        const dup = result[pacificDate].some(e =>
-                          e.home === event.home && e.away === event.away && e.isoDate === event.isoDate
-                        );
-                        if (!dup) result[pacificDate].push(event);
+                        if (comp.broadcasts && comp.broadcasts.length)
+                          rawBroadcast = comp.broadcasts[0].names?.[0] || comp.broadcasts[0].media?.shortName || null;
+                        if (!rawBroadcast && comp.geoBroadcasts && comp.geoBroadcasts.length)
+                          rawBroadcast = comp.geoBroadcasts[0].media?.shortName || null;
                       } catch(e) {}
-                    }
-                  } catch(e) {
-                    console.warn(`Failed: ${lg.espn} / ${dateStr}:`, e.message);
+                      const event = {
+                        league:       lg.label,
+                        isWomen:      lg.women,
+                        home:         home.team.shortDisplayName || home.team.abbreviation,
+                        away:         away.team.shortDisplayName || away.team.abbreviation,
+                        homeFull:     home.team.displayName || '',
+                        awayFull:     away.team.displayName || '',
+                        homeScore:    home.score !== undefined ? parseInt(home.score) : null,
+                        awayScore:    away.score !== undefined ? parseInt(away.score) : null,
+                        status:       ev.status.type.state,
+                        statusDetail: ev.status.type.shortDetail || '',
+                        isoDate:      ev.date,
+                        venue:        comp.venue ? comp.venue.fullName : '',
+                        broadcast:    rawBroadcast,
+                      };
+                      if (!result[pacificDate]) result[pacificDate] = [];
+                      const dup = result[pacificDate].some(e =>
+                        e.home === event.home && e.away === event.away && e.isoDate === event.isoDate
+                      );
+                      if (!dup) { result[pacificDate].push(event); counts[lg.label]++; }
+                    } catch(e) {}
                   }
+                } catch(e) {
+                  console.warn(`Skipped ${lg.espn} [${range}]: ${e.message}`);
                 }
-              }
             }
 
-            // Sort each day's events by time
+            // Per-league tallies. A league sitting at 0 in-season means either
+            // its slug is wrong or ESPN ignored the date range for it.
+            for (const [label, n] of Object.entries(counts)) {
+              console.log(`  ${label}: ${n} events`);
+            }
+
+            // Sort each day by time
             for (const date of Object.keys(result)) {
               result[date].sort((a, b) => new Date(a.isoDate) - new Date(b.isoDate));
             }
-
             const output = {
               generated: new Date().toISOString(),
               days: result,
             };
+            const totalEvents = Object.values(result).reduce((s, d) => s + d.length, 0);
+
+            // Guard: never overwrite a good schedule.json with an empty one.
+            // On 2026-08-05 ESPN began 403ing site.api.espn.com for non-browser
+            // clients. Every request failed, the run "succeeded", and an empty
+            // days:{} was committed hourly for weeks with no visible signal.
+            // Fail the job loudly and leave the last known-good file in place.
+            if (totalEvents === 0) {
+              console.error('ABORT: zero events fetched across all leagues and dates.');
+              console.error('Every ESPN request failed. schedule.json left unchanged.');
+              process.exit(1);
+            }
 
             fs.writeFileSync('schedule.json', JSON.stringify(output, null, 2));
-            console.log('Written schedule.json —', Object.keys(result).length, 'days,',
-              Object.values(result).reduce((s,d) => s + d.length, 0), 'total events');
+            console.log(`Written schedule.json: ${Object.keys(result).length} days, ${totalEvents} total events`);
           }
-
-          main().catch(e => { console.error(e); process.exit(1); });
+          main().catch(e => { console.error('Fatal:', e); process.exit(1); });
           SCRIPT
-
-      - name: Commit and push
+      - name: Commit and push schedule.json
         run: |
           git config user.name "OAC Schedule Bot"
-          git config user.email "schedule-bot@oac59grand.github.io"
+          git config user.email "actions@github.com"
           git add schedule.json
           git diff --staged --quiet || git commit -m "Auto-update schedule $(date -u '+%Y-%m-%d %H:%M UTC')"
           git push
